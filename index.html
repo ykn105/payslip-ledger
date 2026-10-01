@@ -396,6 +396,8 @@ body {
   background-position: right 12px center;
   background-size: 16px 16px;
 }
+.note-text { white-space: pre-wrap; word-break: break-word; }
+.field textarea.auto-grow { resize: none; overflow: hidden; min-height: 96px; line-height: 1.6; }
 .field input:focus, .field select:focus, .field textarea:focus, button:focus-visible {
   outline: 2px solid var(--blue);
   outline-offset: 1px;
@@ -791,7 +793,7 @@ function renderHome() {
         ${otherRows}
       </div>
       ${bonusSection}
-      ${doc.note ? `<div class="section"><div class="item-memo" style="font-size:0.8rem;">${esc(doc.note)}</div></div>` : ""}
+      ${doc.note ? `<div class="section"><div class="item-memo note-text" style="font-size:0.8rem;">${esc(doc.note)}</div></div>` : ""}
       <div class="card-actions">
         <button data-edit-regular="${ym}">編集</button>
         ${bonusActionBtn}
@@ -1029,7 +1031,7 @@ function renderRegularFields(f) {
     </div>
     <div class="field">
       <label>全体メモ</label>
-      <textarea id="f-note" rows="2">${f.note||""}</textarea>
+      <textarea id="f-note" rows="4" class="auto-grow" placeholder="改行して書けます">${esc(f.note||"")}</textarea>
     </div>
   `;
 }
@@ -1160,7 +1162,10 @@ function bindCameraEvents() {
       $("#f-yearMonth").oninput = (e) => { f.yearMonth = e.target.value; };
       $("#f-paymentMonth").oninput = (e) => { f.paymentMonth = e.target.value; };
       $("#f-actualDeposit").oninput = (e) => { f.actualDeposit = e.target.value; };
-      $("#f-note").oninput = (e) => { f.note = e.target.value; };
+      const noteEl = $("#f-note");
+      const grow = () => { noteEl.style.height = "auto"; noteEl.style.height = noteEl.scrollHeight + 2 + "px"; };
+      noteEl.oninput = (e) => { f.note = e.target.value; grow(); };
+      grow();
       bindItemRows(["attendance","earnings","deductions","other"]);
     } else if (state.camCategory === "bonus") {
       const sel = $("#f-targetYM");
