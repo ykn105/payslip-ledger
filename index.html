@@ -1155,7 +1155,7 @@ async function getDigitWorker() {
 }
 
 // characters the Japanese model tends to output where a digit was printed
-const NUMISH = /[0-9０-９,.，．\-OoＯｏ〇lI|｜]/;
+const NUMISH = /[0-9０-９,.，．\-OoＯｏ〇]/;
 function hasDigit(t) { return /[0-9０-９]/.test(t); }
 
 // re-read every number in the page with the digits-only model, using the Japanese pass's character boxes
@@ -1196,12 +1196,12 @@ async function refineNumbers(canvas, data) {
       const t = (r.data.text || "").replace(/\s/g, "");
       const newDigits = t.replace(/[^0-9]/g, "");
       // only swap misread digits (e.g. 9 -> 0); keep the original's punctuation and digit count
-      const isDigitish = (ch) => /[0-9０-９OoＯｏ〇lI|｜]/.test(ch);
+      const isDigitish = (ch) => /[0-9０-９OoＯｏ〇]/.test(ch);
       const slots = job.run.filter(sy => isDigitish(sy.text));
       if (newDigits.length === slots.length && slots.length > 0) {
         slots.forEach((sy, i) => { sy._replaced = newDigits[i]; });
       } else {
-        const fix = { "O":"0","o":"0","Ｏ":"0","ｏ":"0","〇":"0","l":"1","I":"1","|":"1","｜":"1" };
+        const fix = { "O":"0","o":"0","Ｏ":"0","ｏ":"0","〇":"0" };
         job.run.forEach(sy => { if (fix[sy.text]) sy._replaced = fix[sy.text]; });
       }
     } catch (e) { console.warn("digit recheck failed", e); }
@@ -1263,38 +1263,95 @@ async function getOcrWorker() {
   return ocrWorker;
 }
 
-// shrink + grayscale + contrast stretch: helps accuracy and speed on phone photos
-function preprocessImage(file) {
+// grayscale -> adaptive threshold (robust to shadows) -> erase long table lines
+function preprocessImage(file, variant) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
-      // Tesseract reads best when characters are ~30px tall: upscale small images, cap huge ones
-      const TARGET = 2400;
-      let w = img.naturalWidth, h = img.naturalHeight;
-      const scale = Math.min(1, TARGET / Math.max(w, h)); // shrink huge photos only; upscaling amplifies noise
-      w = Math.round(w * scale); h = Math.round(h * scale);
-      const cv = document.createElement("canvas");
-      cv.width = w; cv.height = h;
-      const ctx = cv.getContext("2d");
-      ctx.drawImage(img, 0, 0, w, h);
-      const im = ctx.getImageData(0, 0, w, h);
-      const d = im.data;
-      let min = 255, max = 0;
-      for (let i = 0; i < d.length; i += 4) {
-        const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        d[i] = g;
-        if (g < min) min = g;
-        if (g > max) max = g;
-      }
-      const range = Math.max(1, max - min);
-      for (let i = 0; i < d.length; i += 4) {
-        const v = ((d[i] - min) / range) * 255;
-        d[i] = d[i + 1] = d[i + 2] = v;
-      }
-      ctx.putImageData(im, 0, 0);
-      URL.revokeObjectURL(url);
-      resolve(cv);
+      try {
+        const opts = Object.assign({}, variant || {}, window.__OCR_OPTS || {});
+        const TARGET = 2400;
+        let w = img.naturalWidth, h = img.naturalHeight;
+        let scale = Math.min(1, TARGET / Math.max(w, h));
+        if (opts.upscale !== false && Math.max(w, h) < 1600) scale = Math.min(2, 1800 / Math.max(w, h));
+        w = Math.round(w * scale); h = Math.round(h * scale);
+        const cv = document.createElement("canvas");
+        cv.width = w; cv.height = h;
+        const ctx = cv.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        const im = ctx.getImageData(0, 0, w, h);
+        const d = im.data;
+        const N = w * h;
+        const g = new Float32Array(N);
+        for (let i = 0, j = 0; j < N; i += 4, j++) g[j] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+
+        // integral image for local mean
+        const W1 = w + 1;
+        const integ = new Float64Array(W1 * (h + 1));
+        for (let y = 0; y < h; y++) {
+          let row = 0;
+          for (let x = 0; x < w; x++) {
+            row += g[y * w + x];
+            integ[(y + 1) * W1 + (x + 1)] = integ[y * W1 + (x + 1)] + row;
+          }
+        }
+        const r = Math.max(8, Math.round(Math.min(w, h) / 40));
+        const C = opts.C != null ? opts.C : 12;
+        const ink = new Uint8Array(N);
+        for (let y = 0; y < h; y++) {
+          const y0 = Math.max(0, y - r), y1 = Math.min(h - 1, y + r);
+          for (let x = 0; x < w; x++) {
+            const x0 = Math.max(0, x - r), x1 = Math.min(w - 1, x + r);
+            const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+            const sum = integ[(y1 + 1) * W1 + (x1 + 1)] - integ[y0 * W1 + (x1 + 1)] - integ[(y1 + 1) * W1 + x0] + integ[y0 * W1 + x0];
+            ink[y * w + x] = g[y * w + x] < sum / area - C ? 1 : 0;
+          }
+        }
+
+        // erase vertical / horizontal runs much longer than a character
+        const vLen = opts.vLen || Math.max(30, Math.round(h * 0.045));
+        const hLen = opts.hLen || Math.max(40, Math.round(w * 0.05));
+        const erase = new Uint8Array(N);
+        for (let x = 0; x < w; x++) {
+          let run = 0;
+          for (let y = 0; y <= h; y++) {
+            if (y < h && ink[y * w + x]) run++;
+            else {
+              if (run >= vLen) for (let k = y - run; k < y; k++) { erase[k * w + x] = 1; if (x > 0) erase[k * w + x - 1] = 1; if (x < w - 1) erase[k * w + x + 1] = 1; }
+              run = 0;
+            }
+          }
+        }
+        for (let y = 0; y < h; y++) {
+          let run = 0;
+          for (let x = 0; x <= w; x++) {
+            if (x < w && ink[y * w + x]) run++;
+            else {
+              if (run >= hLen) for (let k = x - run; k < x; k++) { erase[y * w + k] = 1; if (y > 0) erase[(y - 1) * w + k] = 1; if (y < h - 1) erase[(y + 1) * w + k] = 1; }
+              run = 0;
+            }
+          }
+        }
+        if (opts.binarize) {
+          for (let i = 0, j = 0; j < N; i += 4, j++) {
+            const v = (ink[j] && !erase[j]) ? 0 : 255;
+            d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+          }
+        } else {
+          // keep grayscale shading (better for blurry text); stretch contrast, paint table lines white
+          let mn = 255, mx = 0;
+          for (let j = 0; j < N; j++) { if (!erase[j]) { if (g[j] < mn) mn = g[j]; if (g[j] > mx) mx = g[j]; } }
+          const rg = Math.max(1, mx - mn);
+          for (let i = 0, j = 0; j < N; i += 4, j++) {
+            const v = erase[j] ? 255 : Math.max(0, Math.min(255, ((g[j] - mn) / rg) * 255));
+            d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+          }
+        }
+        ctx.putImageData(im, 0, 0);
+        URL.revokeObjectURL(url);
+        resolve(cv);
+      } catch (e) { URL.revokeObjectURL(url); reject(e); }
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image_load_failed")); };
     img.src = url;
@@ -1308,11 +1365,25 @@ async function runOcr(file) {
   render();
   try {
     const worker = await getOcrWorker();
-    setOcrStep("④ 写真を準備中…");
-    const canvas = await withTimeout(preprocessImage(file), 30000, "写真の準備");
-    setOcrStep("⑤ 文字を読み取っています…");
-    const { data } = await withTimeout(worker.recognize(canvas, {}, { text: true, blocks: true }), 180000, "文字の読み取り");
-    if (mySeq !== ocr.seq) return; // a newer photo was chosen meanwhile
+    // two preprocessing variants; keep whichever yields more payslip items
+    const variants = [
+      { label: "1/2", opts: { binarize: true } },
+      { label: "2/2", opts: { binarize: false, upscale: false } },
+    ];
+    let best = null;
+    for (const v of variants) {
+      setOcrStep(`④ 写真を準備中…（${v.label}）`);
+      const cv = await withTimeout(preprocessImage(file, v.opts), 30000, "写真の準備");
+      setOcrStep(`⑤ 文字を読み取っています…（${v.label}）`);
+      const res = await withTimeout(worker.recognize(cv, {}, { text: true, blocks: true }), 180000, "文字の読み取り");
+      if (mySeq !== ocr.seq) return; // a newer photo was chosen meanwhile
+      const p = parsePayslipText(res.data.text || "");
+      // count only items whose name looks like a real payslip item, so OCR junk can't win
+      const all = p.attendance.concat(p.earnings, p.deductions, p.other);
+      const score = all.filter(it => KNOWN_STARTS.some(k => it.name.replace(/^\(/, "").startsWith(k))).length;
+      if (!best || score > best.score) best = { score, canvas: cv, data: res.data };
+    }
+    const canvas = best.canvas, data = best.data;
     let finalText = (data && data.text) ? data.text : "";
     try {
       ocr.progress = 0; setOcrStep("⑥ 数字を確認しています…");
@@ -1360,6 +1431,15 @@ function normalizeOcrText(t) {
     .replace(/[，、]/g, ",").replace(/[．]/g, ".")
     .replace(/[￥\\]/g, "¥").replace(/[－―ー−]/g, m => m === "ー" ? "ー" : "-")
     .replace(/[（]/g, "(").replace(/[）]/g, ")")
+    .replace(/[|｜\[\]「」]/g, " ")              // table borders
+    // a stray kana/latin char between digit groups is a misread comma: "1L186" / "4 る 340" -> "1,186" / "4,340"
+    .replace(/(\d{1,3})\s*[ぁ-んァ-ヶA-Za-z、・'`"]\s*(\d{3})(?!\d)/g, (all, a, b, off, str) => (off > 0 && /\d/.test(str[off - 1])) ? all : a + "," + b)
+    // i / l / I touching digits are 1s: "1i,396" -> "11,396"
+    .replace(/(\d)[iIl](?=[\d,])/g, "$11").replace(/(^|[^A-Za-z])[iIl](?=\d)/g, "$11")
+    // a lone o/O where a value should be is 0
+    .replace(/(\s)[oOＯ〇](?=\s|$)/g, "$10")
+    .replace(/(\d)\s*([,.])\s*(?=\d)/g, "$1$2")   // "205, 000" -> "205,000"
+    .replace(/(\d)\s+(?=\d{3}(?!\d))/g, "$1")      // "205 000" -> "205000"
     .replace(/\r/g, "");
 }
 // Tesseract often puts spaces between Japanese characters: join them, but keep spaces around numbers
@@ -1372,16 +1452,22 @@ function joinJapaneseSpaces(line) {
   return line;
 }
 
-const RE_SKIP  = /(合計|総額|小計|差引|支給額計|控除額計|総支給|振込|口座|銀行|氏名|社員|番号|所属|部署|コード|ページ)/;
+const RE_SKIP  = /(合計|総額|小計|差引|支給額計|控除額計|総支給|振込|口座|銀行|氏名|社員|番号|所属|部署|コード|ページ|月分|支給日|給与$|様|現金支給|現物支給|引支給|支給額|^手当$)/;
 const RE_OTHER = /(還付|調整|精算|立替|返金)/;
 const RE_DED   = /(保険|年金|所得税|住民税|源泉|控除|組合費|社宅|寮費|財形|積立|子育て|介護|雇用|親睦|会費|天引)/;
 const RE_ATT   = /(日数|出勤|欠勤|有給|有休|休日|残日|時間|遅刻|早退)/;
-const RE_EARN  = /(給|手当|賞与|報酬|割増|インセンティブ|歩合)/;
+const RE_EARN  = /(給|手当|賞与|報酬|割増|インセンティブ|歩合|通勤費|交通費)/;
+const RE_NEG_EARN = /(欠勤|遅刻|早退|遅早)控除/; // printed in the 支給 column and subtracted from it
 
 // frequent Japanese-model misreads in payslip item names
-const LABEL_FIXES = [[/出動/g,"出勤"],[/欠動/g,"欠勤"],[/通動/g,"通勤"],[/勤急/g,"勤怠"],[/健庫/g,"健康"],[/厚性/g,"厚生"],[/住民悦/g,"住民税"],[/所得悦/g,"所得税"],[/手冶/g,"手当"],[/基木給/g,"基本給"]];
+const LABEL_FIXES = [[/礎用/g,"雇用"],[/履用/g,"雇用"],[/議師|詳師/g,"講師"],[/(後|衝|役)隊/g,"役職"],[/技龍/g,"技能"],[/係険/g,"保険"],[/保除/g,"保険"],[/選付/g,"還付"],[/昌数/g,"日数"],[/目数/g,"日数"],[/思付/g,"還付"],[/還村/g,"還付"],[/年金保$/g,"年金保険"],[/有体/g,"有休"],[/出動/g,"出勤"],[/欠動/g,"欠勤"],[/通動/g,"通勤"],[/勤急/g,"勤怠"],[/健庫/g,"健康"],[/厚性/g,"厚生"],[/住民悦/g,"住民税"],[/所得悦/g,"所得税"],[/手冶/g,"手当"],[/基木給/g,"基本給"]];
+const KNOWN_STARTS = ["基本給","時間外","残業","休日","深夜","役職","技能","営業","在宅","特別","講師","通勤","非課税","欠勤","出勤","有休","有給","健康","介護","厚生","雇用","所得","住民","社保","年末","子育て","家族","住宅","資格","皆勤","精勤","職務","調整"];
 function cleanLabel(l) {
   for (const [re, to] of LABEL_FIXES) l = l.replace(re, to);
+  // OCR noise glued in front of a known item name: keep from the known word on
+  if (!KNOWN_STARTS.some(k => l.startsWith(k) || l.startsWith("(" + k))) {
+    for (const k of KNOWN_STARTS) { const i = l.indexOf(k); if (i > 0 && i <= 2) { l = l.slice(i); break; } }
+  }
   return l.replace(/^[\s:：・\-*|｜\[\]【】()]+|[\s:：・\-*|｜\[\]【】円¥]+$/g, "").trim();
 }
 function toNumber(raw, allowDecimal) {
@@ -1447,18 +1533,19 @@ function parsePayslipText(text) {
       if (RE_SKIP.test(label) || /^(年|月|日|分)$/.test(label)) continue;
       if (/年$|月$/.test(label) && /^\d{1,4}$/.test(mm[2])) continue; // dates like 2026年
       const isAtt = RE_ATT.test(label) && !/手当/.test(label) && !RE_OTHER.test(label) && !RE_DED.test(label);
-      const value = toNumber(mm[2], isAtt);
+      let value = toNumber(mm[2], isAtt);
+      if (isAtt && /日数/.test(label) && value !== null && Math.abs(value) >= 100 && /00$/.test(mm[2])) value = value / 100;
       if (value === null) continue;
       if (seen.has(label)) continue;
       seen.add(label);
 
       let target;
+      if (RE_NEG_EARN.test(label)) { result.earnings.push({ name: label, amount: String(-Math.abs(value)) }); continue; }
       if (RE_OTHER.test(label)) target = "other";
       else if (RE_DED.test(label)) target = "deductions";
       else if (isAtt) target = "attendance";
       else if (RE_EARN.test(label)) target = "earnings";
-      else target = section;
-      if (!target) continue;
+      else continue; // unknown labels are usually noise (stamps, redactions, layout text)
 
       if (target === "attendance") result.attendance.push({ name: label, value: String(value) });
       else result[target].push({ name: label, amount: String(Math.abs(value)) });
