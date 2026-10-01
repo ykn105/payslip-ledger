@@ -887,7 +887,7 @@ function itemRowsHtml(section, list, amountLabel) {
   return list.map(it => `
     <div class="entry-row" data-section="${section}" data-id="${it.id}">
       <input type="text" class="f-name" placeholder="項目名" value="${esc(it.name)}">
-      <input type="number" class="${amountLabel==='value'?'val-input':'amt-input'}" placeholder="${amountLabel==='value'?'数値':'金額'}" value="${esc(amountLabel==='value'?it.value:it.amount)}">
+      <input type="number" step="any" inputmode="${amountLabel==='value'?'decimal':'numeric'}" class="${amountLabel==='value'?'val-input':'amt-input'}" placeholder="${amountLabel==='value'?'数値':'金額'}" value="${esc(amountLabel==='value'?it.value:it.amount)}">
       <button type="button" class="rm" data-rm="${it.id}">✕</button>
     </div>
     <input type="text" class="entry-memo-input" data-memo="${it.id}" placeholder="備考・メモ" value="${esc(it.memo)}">
@@ -1141,6 +1141,89 @@ function updateOcrProgressUI() {
   if (bar) bar.style.width = Math.round(ocr.progress * 100) + "%";
 }
 
+const ENG_LANG_PATH = "https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng/4.0.0_best_int";
+let digitWorker = null;
+async function getDigitWorker() {
+  if (digitWorker) return digitWorker;
+  const w = await withTimeout(Tesseract.createWorker("eng", 1, {
+    ...TESS_PATHS, langPath: ENG_LANG_PATH, workerBlobURL: true,
+    errorHandler: (err) => console.error("digit worker error", err),
+  }), 180000, "数字用データの読み込み");
+  await w.setParameters({ tessedit_char_whitelist: "0123456789,.-", tessedit_pageseg_mode: "7" });
+  digitWorker = w;
+  return digitWorker;
+}
+
+// characters the Japanese model tends to output where a digit was printed
+const NUMISH = /[0-9０-９,.，．\-OoＯｏ〇lI|｜]/;
+function hasDigit(t) { return /[0-9０-９]/.test(t); }
+
+// re-read every number in the page with the digits-only model, using the Japanese pass's character boxes
+async function refineNumbers(canvas, data) {
+  const lines = (data && data.lines) || [];
+  const jobs = [];
+  for (const line of lines) {
+    for (const word of (line.words || [])) {
+      const syms = word.symbols || [];
+      let run = [];
+      const flush = () => {
+        if (run.length && run.some(sy => hasDigit(sy.text))) jobs.push({ word, run: run.slice() });
+        run = [];
+      };
+      for (const sy of syms) { if (NUMISH.test(sy.text)) run.push(sy); else flush(); }
+      flush();
+    }
+  }
+  if (!jobs.length) return;
+  const w = await getDigitWorker();
+  let done = 0;
+  for (const job of jobs) {
+    const x0 = Math.min(...job.run.map(s => s.bbox.x0)), y0 = Math.min(...job.run.map(s => s.bbox.y0));
+    const x1 = Math.max(...job.run.map(s => s.bbox.x1)), y1 = Math.max(...job.run.map(s => s.bbox.y1));
+    const pad = Math.max(4, Math.round((y1 - y0) * 0.25));
+    const sx = Math.max(0, x0 - pad), sy = Math.max(0, y0 - pad);
+    const sw = Math.min(canvas.width - sx, x1 - x0 + pad * 2), sh = Math.min(canvas.height - sy, y1 - y0 + pad * 2);
+    if (sw < 4 || sh < 4) continue;
+    const scale = Math.max(1, 64 / sh);
+    const c = document.createElement("canvas");
+    const border = 12;
+    c.width = Math.round(sw * scale) + border * 2; c.height = Math.round(sh * scale) + border * 2;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(canvas, sx, sy, sw, sh, border, border, Math.round(sw * scale), Math.round(sh * scale));
+    try {
+      const r = await withTimeout(w.recognize(c), 20000, "数字の確認");
+      const t = (r.data.text || "").replace(/\s/g, "");
+      const newDigits = t.replace(/[^0-9]/g, "");
+      // only swap misread digits (e.g. 9 -> 0); keep the original's punctuation and digit count
+      const isDigitish = (ch) => /[0-9０-９OoＯｏ〇lI|｜]/.test(ch);
+      const slots = job.run.filter(sy => isDigitish(sy.text));
+      if (newDigits.length === slots.length && slots.length > 0) {
+        slots.forEach((sy, i) => { sy._replaced = newDigits[i]; });
+      } else {
+        const fix = { "O":"0","o":"0","Ｏ":"0","ｏ":"0","〇":"0","l":"1","I":"1","|":"1","｜":"1" };
+        job.run.forEach(sy => { if (fix[sy.text]) sy._replaced = fix[sy.text]; });
+      }
+    } catch (e) { console.warn("digit recheck failed", e); }
+    done++;
+    ocr.progress = done / jobs.length; updateOcrProgressUI();
+  }
+}
+
+// rebuild page text from symbols, applying the digit corrections
+function textFromRefined(data) {
+  const out = [];
+  for (const line of (data.lines || [])) {
+    const words = (line.words || []).map(word => {
+      const syms = word.symbols || [];
+      if (!syms.length) return word.text;
+      return syms.map(sy => (sy._replaced !== undefined ? sy._replaced : sy.text)).join("");
+    });
+    out.push(words.join(" "));
+  }
+  return out.join("\n");
+}
+
 const TESS_PATHS = {
   workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
   corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
@@ -1186,9 +1269,10 @@ function preprocessImage(file) {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
-      const MAX = 1600;
+      // Tesseract reads best when characters are ~30px tall: upscale small images, cap huge ones
+      const TARGET = 2400;
       let w = img.naturalWidth, h = img.naturalHeight;
-      const scale = Math.min(1, MAX / Math.max(w, h));
+      const scale = Math.min(1, TARGET / Math.max(w, h)); // shrink huge photos only; upscaling amplifies noise
       w = Math.round(w * scale); h = Math.round(h * scale);
       const cv = document.createElement("canvas");
       cv.width = w; cv.height = h;
@@ -1227,9 +1311,18 @@ async function runOcr(file) {
     setOcrStep("④ 写真を準備中…");
     const canvas = await withTimeout(preprocessImage(file), 30000, "写真の準備");
     setOcrStep("⑤ 文字を読み取っています…");
-    const { data } = await withTimeout(worker.recognize(canvas), 180000, "文字の読み取り");
+    const { data } = await withTimeout(worker.recognize(canvas, {}, { text: true, blocks: true }), 180000, "文字の読み取り");
     if (mySeq !== ocr.seq) return; // a newer photo was chosen meanwhile
-    ocr.text = (data && data.text) ? data.text : "";
+    let finalText = (data && data.text) ? data.text : "";
+    try {
+      ocr.progress = 0; setOcrStep("⑥ 数字を確認しています…");
+      await refineNumbers(canvas, data);
+      if (data.lines && data.lines.length) finalText = textFromRefined(data);
+    } catch (e) {
+      console.warn("number refinement skipped", e); // fall back to the Japanese-only text
+    }
+    if (mySeq !== ocr.seq) return;
+    ocr.text = finalText;
     const n = applyOcrText(ocr.text);
     if (state.camCategory === "withholding") {
       ocr.msg = n ? "支払金額らしき数字を入力しました。内容を確認してください。" : "読み取りましたが、金額を特定できませんでした。下の「読み取った文字を見る」を参考に入力してください。";
@@ -1285,12 +1378,23 @@ const RE_DED   = /(保険|年金|所得税|住民税|源泉|控除|組合費|社
 const RE_ATT   = /(日数|出勤|欠勤|有給|有休|休日|残日|時間|遅刻|早退)/;
 const RE_EARN  = /(給|手当|賞与|報酬|割増|インセンティブ|歩合)/;
 
+// frequent Japanese-model misreads in payslip item names
+const LABEL_FIXES = [[/出動/g,"出勤"],[/欠動/g,"欠勤"],[/通動/g,"通勤"],[/勤急/g,"勤怠"],[/健庫/g,"健康"],[/厚性/g,"厚生"],[/住民悦/g,"住民税"],[/所得悦/g,"所得税"],[/手冶/g,"手当"],[/基木給/g,"基本給"]];
 function cleanLabel(l) {
+  for (const [re, to] of LABEL_FIXES) l = l.replace(re, to);
   return l.replace(/^[\s:：・\-*|｜\[\]【】()]+|[\s:：・\-*|｜\[\]【】円¥]+$/g, "").trim();
 }
-function toNumber(raw) {
-  const neg = /^-/.test(raw);
-  const n = parseInt(raw.replace(/[^\d]/g, ""), 10);
+function toNumber(raw, allowDecimal) {
+  let t = String(raw).replace(/\s/g, "");
+  const neg = /^-/.test(t);
+  t = t.replace(/^-/, "");
+  if (allowDecimal) {
+    // OCR sometimes reads "7.5" as "7,5": a comma followed by 1-2 digits is a decimal point here
+    t = t.replace(/,(\d{1,2})$/, ".$1");
+  }
+  let n;
+  if (allowDecimal && /^\d+\.\d+$/.test(t)) n = parseFloat(t);
+  else n = parseInt(t.replace(/[^\d]/g, ""), 10);
   if (isNaN(n)) return null;
   return neg ? -n : n;
 }
@@ -1335,14 +1439,15 @@ function parsePayslipText(text) {
     }
 
     // label + number pairs (several may appear on one line)
-    const re = /([^\d\s¥,.\-]{2,}?)\s*[:：]?\s*¥?\s*(-?\d{1,3}(?:,\d{3})+|-?\d+(?:\.\d+)?)/g;
+    const re = /([^\d\s¥,.\-]{2,}?)\s*[:：]?\s*¥?\s*(-?\d{1,3}(?:[,.]\d{3})+(?!\d)|-?\d+(?:[.,]\d{1,2}(?!\d))?|-?\d+)/g;
     let mm;
     while ((mm = re.exec(line))) {
       const label = cleanLabel(mm[1]);
       if (label.length < 2 || !/[ぁ-んァ-ヶ一-龠]/.test(label)) continue;
       if (RE_SKIP.test(label) || /^(年|月|日|分)$/.test(label)) continue;
       if (/年$|月$/.test(label) && /^\d{1,4}$/.test(mm[2])) continue; // dates like 2026年
-      const value = toNumber(mm[2]);
+      const isAtt = RE_ATT.test(label) && !/手当/.test(label) && !RE_OTHER.test(label) && !RE_DED.test(label);
+      const value = toNumber(mm[2], isAtt);
       if (value === null) continue;
       if (seen.has(label)) continue;
       seen.add(label);
@@ -1350,7 +1455,7 @@ function parsePayslipText(text) {
       let target;
       if (RE_OTHER.test(label)) target = "other";
       else if (RE_DED.test(label)) target = "deductions";
-      else if (RE_ATT.test(label) && !/手当/.test(label)) target = "attendance";
+      else if (isAtt) target = "attendance";
       else if (RE_EARN.test(label)) target = "earnings";
       else target = section;
       if (!target) continue;
