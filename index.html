@@ -279,29 +279,42 @@ body {
 .cam-header { display: flex; align-items: center; gap: 10px; font-size: 1.15rem; font-weight: 800; margin-bottom: 16px; }
 .cam-header svg { width: 24px; height: 24px; color: var(--blue); }
 
-.photo-box {
-  position: relative;
+.photo-pick-btn {
   width: 100%;
-  height: 190px;
-  border-radius: 16px;
-  background: var(--border);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--ink-faint);
-  font-size: 0.85rem;
-  overflow: hidden;
-  cursor: pointer;
-  margin-bottom: 22px;
-}
-.photo-box img { width: 100%; height: 100%; object-fit: cover; }
-.photo-box .overlay {
-  position: absolute; inset: 0;
-  background: rgba(20,24,40,0.45);
+  gap: 10px;
+  padding: 16px 20px;
+  border: none;
+  border-radius: 14px;
+  background: var(--blue);
   color: #fff;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 0.85rem;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
 }
+.photo-pick-btn svg { width: 22px; height: 22px; }
+.photo-pick-btn.is-change {
+  background: var(--blue-soft);
+  color: var(--blue);
+  padding: 12px 20px;
+  font-size: 14px;
+}
+.photo-pick-sub {
+  text-align: center;
+  font-size: 12px;
+  color: var(--ink-faint);
+  margin: 8px 0 18px;
+}
+.photo-preview {
+  width: 100%;
+  border-radius: 14px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.photo-preview img { width: 100%; height: auto; display: block; }
 
 .step-heading { display: flex; align-items: center; gap: 6px; margin: 20px 0 14px; }
 .step-num {
@@ -795,10 +808,12 @@ function renderCamera() {
   const f = state.camForm;
   const hasPhoto = !!f.photoPreviewUrl;
   const photoBox = `
-    <div class="photo-box" id="photoBox">
-      ${f.photoPreviewUrl ? `<img src="${f.photoPreviewUrl}" alt="撮影した明細">` : `<span>撮った画像を表示</span>`}
-    </div>
-    ${assetsReady ? `<input type="file" accept="image/*" id="photoInput" hidden>` : `<div class="status-line">このビューでは写真の保存が利用できません。</div>`}
+    ${f.photoPreviewUrl ? `<div class="photo-preview"><img src="${f.photoPreviewUrl}" alt="選択した明細"></div>` : ""}
+    <button type="button" class="photo-pick-btn ${f.photoPreviewUrl ? "is-change" : ""}" id="photoBox">
+      ${ICON_CAMERA}<span>${f.photoPreviewUrl ? "写真を変更する" : "写真を撮る・選ぶ"}</span>
+    </button>
+    ${!f.photoPreviewUrl ? `<div class="photo-pick-sub">カメラ／写真ライブラリ／ファイルから選べます</div>` : ""}
+    <input type="file" accept="image/*" id="photoInput" hidden>
   `;
 
   const catSection = `
@@ -815,7 +830,7 @@ function renderCamera() {
 
   let middleHtml;
   if (!hasPhoto) {
-    middleHtml = `<div class="info-note">上の写真エリアをタップして、明細を撮影または選択してください。カテゴリと内容の入力欄はその後に表示されます。</div>`;
+    middleHtml = `<div class="info-note">明細の写真を追加すると、カテゴリと内容の入力欄が表示されます。</div>`;
   } else {
     middleHtml = `${catSection}<div id="catBody">${body}</div>`;
   }
