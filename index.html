@@ -403,7 +403,7 @@ body {
 
 .entry-row {
   display: grid;
-  grid-template-columns: 1.3fr 1fr auto;
+  grid-template-columns: auto 1.3fr 1fr auto;
   gap: 8px;
   margin-bottom: 2px;
   align-items: center;
@@ -422,9 +422,22 @@ body {
   font-family: inherit;
 }
 .entry-memo-input::placeholder { color: var(--ink-faint); }
-.entry-memo-input + .entry-row {
-  margin: 10px 0 0;
+.entry-item + .entry-item { margin-top: 10px; }
+.entry-item { position: relative; border-radius: 8px; transition: transform .15s ease; }
+.entry-item.dragging {
+  transition: none; z-index: 5;
+  background: var(--card);
+  box-shadow: 0 6px 20px rgba(30, 40, 90, 0.18);
 }
+.drag-handle {
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 38px; margin-left: -4px;
+  color: var(--ink-faint); cursor: grab;
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.drag-handle svg { width: 18px; height: 18px; }
+.entry-item.dragging .drag-handle { cursor: grabbing; color: var(--blue); }
+body.is-dragging { user-select: none; -webkit-user-select: none; }
 .add-item-btn {
   background: none; border: none; color: var(--blue);
   font-size: 0.8rem; font-weight: 700; cursor: pointer;
@@ -883,15 +896,98 @@ function renderCamera() {
   `;
 }
 
+const ICON_GRIP = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>';
 function itemRowsHtml(section, list, amountLabel) {
   return list.map(it => `
+    <div class="entry-item" data-section="${section}" data-id="${it.id}">
     <div class="entry-row" data-section="${section}" data-id="${it.id}">
+      <span class="drag-handle" title="ドラッグで並び替え" aria-label="ドラッグで並び替え">${ICON_GRIP}</span>
       <input type="text" class="f-name" placeholder="項目名" value="${esc(it.name)}">
       <input type="number" step="any" inputmode="${amountLabel==='value'?'decimal':'numeric'}" class="${amountLabel==='value'?'val-input':'amt-input'}" placeholder="${amountLabel==='value'?'数値':'金額'}" value="${esc(amountLabel==='value'?it.value:it.amount)}">
       <button type="button" class="rm" data-rm="${it.id}">✕</button>
     </div>
     <input type="text" class="entry-memo-input" data-memo="${it.id}" placeholder="備考・メモ" value="${esc(it.memo)}">
+    </div>
   `).join("");
+}
+
+/* ---------- drag to reorder (pointer events: works with touch on iPhone) ---------- */
+function bindReorder() {
+  $$(".drag-handle").forEach(h => h.addEventListener("pointerdown", startItemDrag));
+}
+function startItemDrag(e) {
+  if (e.button !== undefined && e.button !== 0) return;
+  e.preventDefault();
+  const handle = e.currentTarget;
+  const item = handle.closest(".entry-item");
+  const list = item.parentElement;
+  const section = item.dataset.section;
+  const items = Array.from(list.children).filter(el => el.classList.contains("entry-item"));
+  if (items.length < 2) return;
+  const idx = items.indexOf(item);
+  const sy0 = window.scrollY;
+  const tops = items.map(el => el.getBoundingClientRect().top + sy0);
+  const heights = items.map(el => el.getBoundingClientRect().height);
+  const gap = items.length > 1 ? Math.max(0, tops[1] - (tops[0] + heights[0])) : 0;
+  const shift = heights[idx] + gap;
+  const startPageY = e.clientY + sy0;
+  let lastClientY = e.clientY;
+  let target = idx;
+  let rafId = null;
+
+  item.classList.add("dragging");
+  document.body.classList.add("is-dragging");
+  try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+  if (navigator.vibrate) { try { navigator.vibrate(10); } catch (_) {} }
+
+  const update = () => {
+    const pageY = lastClientY + window.scrollY;
+    const dy = pageY - startPageY;
+    item.style.transform = `translateY(${dy}px)`;
+    const center = tops[idx] + heights[idx] / 2 + dy;
+    target = idx;
+    for (let i = 0; i < items.length; i++) {
+      if (i === idx) continue;
+      const mid = tops[i] + heights[i] / 2;
+      if (i < idx && center < mid) target = Math.min(target, i);
+      if (i > idx && center > mid) target = Math.max(target, i);
+    }
+    items.forEach((el, i) => {
+      if (i === idx) return;
+      let s = 0;
+      if (idx < target && i > idx && i <= target) s = -shift;
+      if (idx > target && i >= target && i < idx) s = shift;
+      el.style.transform = s ? `translateY(${s}px)` : "";
+    });
+  };
+  // auto-scroll near the top / bottom edge (bottom has the save bar and nav)
+  const tick = () => {
+    const edgeTop = 90, edgeBottom = window.innerHeight - 170;
+    let v = 0;
+    if (lastClientY < edgeTop) v = -Math.ceil((edgeTop - lastClientY) / 6);
+    else if (lastClientY > edgeBottom) v = Math.ceil((lastClientY - edgeBottom) / 6);
+    if (v) { window.scrollBy(0, v); update(); }
+    rafId = requestAnimationFrame(tick);
+  };
+  rafId = requestAnimationFrame(tick);
+
+  const onMove = (ev) => { lastClientY = ev.clientY; update(); };
+  const onEnd = () => {
+    cancelAnimationFrame(rafId);
+    handle.removeEventListener("pointermove", onMove);
+    handle.removeEventListener("pointerup", onEnd);
+    handle.removeEventListener("pointercancel", onEnd);
+    document.body.classList.remove("is-dragging");
+    const arr = state.camForm && state.camForm[section];
+    if (arr && target !== idx) {
+      const [moved] = arr.splice(idx, 1);
+      arr.splice(target, 0, moved);
+    }
+    render();
+  };
+  handle.addEventListener("pointermove", onMove);
+  handle.addEventListener("pointerup", onEnd);
+  handle.addEventListener("pointercancel", onEnd);
 }
 
 function renderRegularFields(f) {
@@ -1076,6 +1172,7 @@ function bindCameraEvents() {
       $("#f-memo").oninput = (e) => { f.memo = e.target.value; };
     }
 
+    bindReorder();
     $$(".add-item-btn").forEach(btn => btn.onclick = () => {
       const sec = btn.dataset.add;
       const proto = sec === "attendance" ? {id:uid(),name:"",value:"",memo:""} : {id:uid(),name:"",amount:"",memo:""};
