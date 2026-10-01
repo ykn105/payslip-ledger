@@ -798,7 +798,7 @@ function renderCamera() {
     <div class="photo-box" id="photoBox">
       ${f.photoPreviewUrl ? `<img src="${f.photoPreviewUrl}" alt="撮影した明細">` : `<span>撮った画像を表示</span>`}
     </div>
-    ${assetsReady ? `<input type="file" accept="image/*" capture="environment" id="photoInput" hidden>` : `<div class="status-line">このビューでは写真の保存が利用できません。</div>`}
+    ${assetsReady ? `<input type="file" accept="image/*" id="photoInput" hidden>` : `<div class="status-line">このビューでは写真の保存が利用できません。</div>`}
   `;
 
   const catSection = `
