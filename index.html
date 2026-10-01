@@ -858,24 +858,25 @@ function renderCamera() {
   const ocrPanel = ocr.running
     ? `<div class="ocr-progress"><div id="ocrPhase">${esc(ocr.phase || "読み取りの準備中…")}</div><div class="ocr-bar"><div id="ocrBar" style="width:${Math.round(ocr.progress*100)}%"></div></div></div>`
     : (ocr.msg ? `<div class="ocr-result-note ${ocr.msgErr ? "err" : ""}">${esc(ocr.msg)}</div>` : "")
-      + (ocr.text !== null ? `
+      + ((ocr.text !== null || ocr.msgErr) ? `
         <div class="ocr-tools"><button type="button" id="ocrRetry">もう一度読み取る</button></div>
-        <details class="ocr-raw"><summary>読み取った文字を見る</summary><pre>${esc(ocr.text || "（文字を検出できませんでした）")}</pre></details>` : "");
+        ${ocr.text !== null ? `<details class="ocr-raw"><summary>読み取った文字を見る</summary><pre>${esc(ocr.text || "（文字を検出できませんでした）")}</pre></details>` : ""}` : "");
 
-  let middleHtml;
-  if (!hasPhoto) {
-    middleHtml = `<div class="info-note">明細の写真を追加すると、カテゴリと内容の入力欄が表示されます。</div>`;
-  } else if (ocr.running) {
-    middleHtml = `${catSection}${ocrPanel}`;
-  } else {
-    middleHtml = `${catSection}${ocrPanel}<div id="catBody">${body}</div>`;
-  }
+  const photoStep = `
+    <div class="step-heading"><span class="step-num">02</span><span class="txt">明細の写真を選択してください</span></div>
+    ${photoBox}`;
+
+  let afterPhoto;
+  if (!hasPhoto) afterPhoto = "";
+  else if (ocr.running) afterPhoto = ocrPanel;
+  else afterPhoto = `${ocrPanel}<div id="catBody">${body}</div>`;
 
   return `
     <div class="cam-header">${ICON_CAMERA}カメラで読み取る</div>
-    ${photoBox}
+    ${catSection}
+    ${photoStep}
     <div id="formStatus" class="status-line"></div>
-    ${middleHtml}
+    ${afterPhoto}
     <div class="sticky-save">
       <button class="btn btn-primary" id="saveCamBtn" ${(dbReady && hasPhoto && !ocr.running)?"":"disabled"}>保存</button>
     </div>
@@ -895,7 +896,7 @@ function itemRowsHtml(section, list, amountLabel) {
 
 function renderRegularFields(f) {
   return `
-    <div class="step-heading"><span class="step-num">02</span><span class="txt">内容を確認してください</span></div>
+    <div class="step-heading"><span class="step-num">03</span><span class="txt">内容を確認してください</span></div>
     <div class="field">
       <label>対象年月</label>
       <input type="month" id="f-yearMonth" value="${esc(f.yearMonth)}">
@@ -945,20 +946,20 @@ function renderBonusFields(f) {
 
   if (!months.length) {
     return `
-      <div class="step-heading"><span class="step-num">02</span><span class="txt">どの月の給与明細に追加しますか？</span></div>
+      <div class="step-heading"><span class="step-num">03</span><span class="txt">どの月の給与明細に追加しますか？</span></div>
       <div class="info-note">先に「通常明細」を登録すると、その月に賞与を追加できます。</div>
     `;
   }
 
   return `
-    <div class="step-heading"><span class="step-num">02</span><span class="txt">どの月の給与明細に追加しますか？</span></div>
+    <div class="step-heading"><span class="step-num">03</span><span class="txt">どの月の給与明細に追加しますか？</span></div>
     <div class="field">
       <select id="f-targetYM">
         <option value="">選択してください</option>
         ${options}
       </select>
     </div>
-    <div class="step-heading"><span class="step-num">03</span><span class="txt">内容を確認してください</span></div>
+    <div class="step-heading"><span class="step-num">04</span><span class="txt">内容を確認してください</span></div>
     <div class="section">
       <div class="section-head"><span class="label"><span class="dot purple"></span>賞与支給</span></div>
       <div id="rows-bonusEarnings">${itemRowsHtml("bonusEarnings", f.bonusEarnings, "amount")}</div>
@@ -974,7 +975,7 @@ function renderBonusFields(f) {
 
 function renderWithholdingFields(f) {
   return `
-    <div class="step-heading"><span class="step-num">02</span><span class="txt">内容を確認してください</span></div>
+    <div class="step-heading"><span class="step-num">03</span><span class="txt">内容を確認してください</span></div>
     <div class="field">
       <label>対象年</label>
       <input type="text" id="f-year" value="${esc(f.year)}" placeholder="例: 2026">
@@ -1127,11 +1128,11 @@ function loadTesseract() {
 }
 
 const OCR_PHASES = {
-  "loading tesseract core": "読み取りエンジンを準備中…",
-  "initializing tesseract": "読み取りエンジンを準備中…",
-  "loading language traineddata": "日本語データを読み込み中…（初回のみ時間がかかります）",
-  "initializing api": "読み取りの準備中…",
-  "recognizing text": "文字を読み取っています…",
+  "loading tesseract core": "② 読み取りエンジンを起動中…",
+  "initializing tesseract": "② 読み取りエンジンを起動中…",
+  "loading language traineddata": "③ 日本語データを読み込み中…（初回のみ時間がかかります）",
+  "initializing api": "③ 日本語データを準備中…",
+  "recognizing text": "⑤ 文字を読み取っています…",
 };
 function updateOcrProgressUI() {
   const ph = document.getElementById("ocrPhase");
@@ -1140,10 +1141,29 @@ function updateOcrProgressUI() {
   if (bar) bar.style.width = Math.round(ocr.progress * 100) + "%";
 }
 
+const TESS_PATHS = {
+  workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
+  corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
+  langPath: "https://cdn.jsdelivr.net/npm/@tesseract.js-data/jpn/4.0.0_best_int",
+};
+function withTimeout(promise, ms, stepName) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error("timeout:" + stepName)), ms)),
+  ]);
+}
+function setOcrStep(text) { ocr.phase = text; updateOcrProgressUI(); }
+
 async function getOcrWorker() {
   if (ocrWorker) return ocrWorker;
-  await loadTesseract();
-  ocrWorker = await Tesseract.createWorker("jpn", 1, {
+  setOcrStep("① 読み取りエンジンを読み込み中…");
+  await withTimeout(loadTesseract(), 60000, "エンジンの読み込み");
+  setOcrStep("② 読み取りエンジンを起動中…");
+  let workerError = null;
+  const created = Tesseract.createWorker("jpn", 1, {
+    ...TESS_PATHS,
+    workerBlobURL: true,
+    errorHandler: (err) => { workerError = err; console.error("tesseract worker error", err); },
     logger: (m) => {
       if (!ocr.running) return;
       ocr.phase = OCR_PHASES[m.status] || ocr.phase || "読み取り中…";
@@ -1151,6 +1171,12 @@ async function getOcrWorker() {
       updateOcrProgressUI();
     },
   });
+  try {
+    ocrWorker = await withTimeout(created, 180000, "エンジンの起動・日本語データの読み込み");
+  } catch (e) {
+    if (workerError) e.detail = String(workerError && (workerError.message || workerError));
+    throw e;
+  }
   return ocrWorker;
 }
 
@@ -1160,7 +1186,7 @@ function preprocessImage(file) {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
-      const MAX = 2200;
+      const MAX = 1600;
       let w = img.naturalWidth, h = img.naturalHeight;
       const scale = Math.min(1, MAX / Math.max(w, h));
       w = Math.round(w * scale); h = Math.round(h * scale);
@@ -1197,10 +1223,11 @@ async function runOcr(file) {
   ocr.msg = ""; ocr.msgErr = false;
   render();
   try {
-    const canvas = await preprocessImage(file);
     const worker = await getOcrWorker();
-    ocr.phase = "文字を読み取っています…"; updateOcrProgressUI();
-    const { data } = await worker.recognize(canvas);
+    setOcrStep("④ 写真を準備中…");
+    const canvas = await withTimeout(preprocessImage(file), 30000, "写真の準備");
+    setOcrStep("⑤ 文字を読み取っています…");
+    const { data } = await withTimeout(worker.recognize(canvas), 180000, "文字の読み取り");
     if (mySeq !== ocr.seq) return; // a newer photo was chosen meanwhile
     ocr.text = (data && data.text) ? data.text : "";
     const n = applyOcrText(ocr.text);
@@ -1217,9 +1244,17 @@ async function runOcr(file) {
     if (mySeq !== ocr.seq) return;
     ocr.text = null;
     ocr.msgErr = true;
-    ocr.msg = (e && e.message === "load_failed")
-      ? "読み取りエンジンを読み込めませんでした。通信環境を確認してもう一度お試しください。"
-      : "読み取り中にエラーが発生しました。手動で入力してください。";
+    const msg = String((e && e.message) || e || "");
+    let reason;
+    if (msg === "load_failed") reason = "読み取りエンジンを読み込めませんでした（通信が遮断されている可能性があります）。";
+    else if (msg.startsWith("timeout:")) reason = `「${msg.slice(8)}」の段階で時間切れになりました。`;
+    else if (msg === "image_load_failed") reason = "写真を読み込めませんでした。別の写真でお試しください。";
+    else reason = "読み取り中にエラーが発生しました。";
+    const detail = (e && e.detail) ? e.detail : (msg && !msg.startsWith("timeout:") && msg !== "load_failed" ? msg : "");
+    ocr.msg = reason + (detail ? `（詳細: ${detail}）` : "") + " 手動で入力するか、「もう一度読み取る」をお試しください。";
+    // a failed worker can't be reused
+    try { if (ocrWorker) await ocrWorker.terminate(); } catch (_) {}
+    ocrWorker = null;
   } finally {
     if (mySeq === ocr.seq) { ocr.running = false; render(); }
   }
