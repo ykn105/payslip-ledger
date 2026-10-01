@@ -1059,7 +1059,7 @@ function bindCameraEvents() {
 
   const f = state.camForm;
   const hasPhoto = !!f.photoPreviewUrl;
-  if (hasPhoto) {
+  if (hasPhoto && !ocr.running) {
     if (state.camCategory === "regular") {
       $("#f-yearMonth").oninput = (e) => { f.yearMonth = e.target.value; };
       $("#f-paymentMonth").oninput = (e) => { f.paymentMonth = e.target.value; };
